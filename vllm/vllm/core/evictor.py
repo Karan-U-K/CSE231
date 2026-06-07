@@ -368,11 +368,29 @@ class ShadowPolicyCache:
     RRIP_INSERT_RRPV = RRIP_MAX_RRPV - 1
     RRIP_HIT_RRPV = 0
 
-    def __init__(self, policy: str, capacity: int):
+    def __init__(self, policy: str, capacity: int, config: dict = None):
         self.policy = policy
         self.capacity = capacity
         self.table = {}
         self.events = deque()
+        if policy == "pdp":
+            cfg = config or {}
+            self.pdp_epoch = 0
+            self.pdp_protecting_distance = int(
+                cfg.get("pdp_initial_pd", PDPEvictor.DEFAULT_INITIAL_PD))
+            self.pdp_max_distance = int(
+                cfg.get("pdp_max_distance", PDPEvictor.DEFAULT_MAX_DISTANCE))
+            self.pdp_recompute_interval = int(
+                cfg.get("pdp_recompute_interval",
+                        PDPEvictor.DEFAULT_RECOMPUTE_INTERVAL))
+            self.pdp_bucket_size = int(
+                cfg.get("pdp_bucket_size", PDPEvictor.DEFAULT_BUCKET_SIZE))
+            self.pdp_eviction_distance = int(
+                cfg.get("pdp_eviction_distance",
+                        PDPEvictor.DEFAULT_EVICTION_DISTANCE))
+            self.pdp_last_seen_epoch: Dict[int, int] = {}
+            self.pdp_reuse_distance_counts = defaultdict(int)
+            self.pdp_total_accesses = 0
 
     def set_capacity(self, capacity: int):
         self.capacity = capacity
@@ -392,6 +410,17 @@ class ShadowPolicyCache:
         hit = content_hash in self.table
         self.events.append((now, 1 if hit else 0))
 
+        if self.policy == "pdp":
+            self.pdp_epoch += 1
+            self.pdp_total_accesses += 1
+            prev_epoch = self.pdp_last_seen_epoch.get(content_hash)
+            if prev_epoch is not None:
+                dist = self._pdp_bucket_distance(self.pdp_epoch - prev_epoch)
+                self.pdp_reuse_distance_counts[dist] += 1
+            self.pdp_last_seen_epoch[content_hash] = self.pdp_epoch
+            if self.pdp_total_accesses % self.pdp_recompute_interval == 0:
+                self._pdp_recompute()
+
         if hit:
             entry = self.table[content_hash]
             entry["last_accessed"] = now
@@ -400,22 +429,32 @@ class ShadowPolicyCache:
                 entry["rrpv"] = self.RRIP_HIT_RRPV
             elif self.policy == "ml":
                 entry["score"] = self._ml_score(entry, cache_hint, now)
+            elif self.policy == "pdp":
+                entry["pdp_protected_until"] = (
+                    self.pdp_epoch + self.pdp_protecting_distance)
+                entry["pdp_last_access_epoch"] = self.pdp_epoch
+                entry["pdp_reused"] = True
             return
 
         if self.capacity <= 0:
             return
         while len(self.table) >= self.capacity:
             self._evict()
-        self.table[content_hash] = {
+        new_entry = {
             "first_accessed": now,
             "last_accessed": now,
             "rrpv": self.RRIP_INSERT_RRPV,
             "score": 0.0,
             "cache_hint": cache_hint,
         }
-        if self.policy == "ml":
-            self.table[content_hash]["score"] = self._ml_score(
-                self.table[content_hash], cache_hint, now)
+        if self.policy == "pdp":
+            new_entry["pdp_protected_until"] = (
+                self.pdp_epoch + self.pdp_protecting_distance)
+            new_entry["pdp_last_access_epoch"] = self.pdp_epoch
+            new_entry["pdp_reused"] = False
+        elif self.policy == "ml":
+            new_entry["score"] = self._ml_score(new_entry, cache_hint, now)
+        self.table[content_hash] = new_entry
 
     def _ml_score(self, entry: dict, cache_hint: Optional[dict],
                   now: float) -> float:
@@ -433,6 +472,8 @@ class ShadowPolicyCache:
                          key=lambda h: (self.table[h]["first_accessed"], h))
         elif self.policy == "rrip":
             victim = self._rrip_victim()
+        elif self.policy == "pdp":
+            victim = min(self.table, key=lambda h: self._pdp_victim_key(h))
         elif self.policy == "ml":
             now = time.time()
             victim = min(
@@ -460,10 +501,55 @@ class ShadowPolicyCache:
             for entry in self.table.values():
                 entry["rrpv"] = min(self.RRIP_MAX_RRPV, entry["rrpv"] + 1)
 
+    def _pdp_victim_key(self, content_hash: int) -> tuple:
+        entry = self.table[content_hash]
+        protected_until = entry.get("pdp_protected_until", 0)
+        expired = protected_until <= self.pdp_epoch
+        if expired:
+            return (0, entry.get("pdp_last_access_epoch", 0),
+                    entry["last_accessed"], content_hash)
+        remaining = protected_until - self.pdp_epoch
+        reused = entry.get("pdp_reused", False)
+        return (1, 1 if reused else 0, -remaining,
+                -entry.get("pdp_last_access_epoch", 0), content_hash)
+
+    def _pdp_bucket_distance(self, distance: int) -> int:
+        distance = max(1, min(distance, self.pdp_max_distance))
+        if self.pdp_bucket_size == 1:
+            return distance
+        return min(self.pdp_max_distance,
+                   ((distance + self.pdp_bucket_size - 1) //
+                    self.pdp_bucket_size) * self.pdp_bucket_size)
+
+    def _pdp_recompute(self):
+        if not self.pdp_reuse_distance_counts or self.pdp_total_accesses == 0:
+            return
+        distances = sorted(self.pdp_reuse_distance_counts.items())
+        best_distance = self.pdp_protecting_distance
+        best_score = -1.0
+        cumulative_hits = 0
+        cumulative_cost = 0
+        idx = 0
+        for distance in range(1, self.pdp_max_distance + 1,
+                               self.pdp_bucket_size):
+            while idx < len(distances) and distances[idx][0] <= distance:
+                reuse_distance, count = distances[idx]
+                cumulative_hits += count
+                cumulative_cost += reuse_distance * count
+                idx += 1
+            misses = max(0, self.pdp_total_accesses - cumulative_hits)
+            denominator = (cumulative_cost +
+                           misses * (distance + self.pdp_eviction_distance))
+            score = cumulative_hits / denominator if denominator > 0 else 0.0
+            if score > best_score:
+                best_score = score
+                best_distance = distance
+        self.pdp_protecting_distance = best_distance
+
 
 class EvictionPolicyScheduler:
-    POLICIES = ("ml", "lru", "rrip", "fifo")
-    SHADOW_POLICIES = ("lru", "rrip", "fifo")
+    POLICIES = ("ml", "lru", "rrip", "fifo", "pdp")
+    SHADOW_POLICIES = ("lru", "rrip", "fifo", "pdp")
 
     def __init__(self, config: dict):
         self.enabled = self._as_bool(config.get("enable_scheduler", "0"))
@@ -483,7 +569,9 @@ class EvictionPolicyScheduler:
         self.num_observed_accesses = 0
         self.ml_events = deque()
         self.shadow_caches = {
-            policy: ShadowPolicyCache(policy, self.capacity)
+            policy: ShadowPolicyCache(
+                policy, self.capacity,
+                config if policy == "pdp" else None)
             for policy in self.SHADOW_POLICIES
         }
 
@@ -576,6 +664,28 @@ class LRUMLEvictor(Evictor):
         self.last_refresh_time = time.time()
         self.INSPECT_INTERVAL = 5
         self.scheduler = EvictionPolicyScheduler(self.config)
+        # PDP state — used when the scheduler selects PDP post-warmup
+        cfg = self.config
+        self.pdp_request_epoch = 0
+        self.pdp_protecting_distance = int(
+            cfg.get("pdp_initial_pd", PDPEvictor.DEFAULT_INITIAL_PD))
+        self.pdp_max_distance = int(
+            cfg.get("pdp_max_distance", PDPEvictor.DEFAULT_MAX_DISTANCE))
+        self.pdp_recompute_interval = int(
+            cfg.get("pdp_recompute_interval",
+                    PDPEvictor.DEFAULT_RECOMPUTE_INTERVAL))
+        self.pdp_bucket_size = int(
+            cfg.get("pdp_bucket_size", PDPEvictor.DEFAULT_BUCKET_SIZE))
+        self.pdp_eviction_distance = int(
+            cfg.get("pdp_eviction_distance",
+                    PDPEvictor.DEFAULT_EVICTION_DISTANCE))
+        self.pdp_last_seen_epoch: Dict[int, int] = {}
+        self.pdp_reuse_distance_counts = defaultdict(int)
+        self.pdp_total_accesses = 0
+        self.pdp_protected_until_epoch: Dict[int, int] = {}
+        self.pdp_reused: Dict[int, bool] = {}
+        self.pdp_last_access_epoch: Dict[int, int] = {}
+        self.pdp_content_hash_to_block_id: Dict[int, int] = {}
 
     def __contains__(self, block_id: int) -> bool:
         return block_id in self.free_table
@@ -606,16 +716,24 @@ class LRUMLEvictor(Evictor):
     def observe_cache_access(self, content_hash: int,
                              cache_hint: Optional[dict] = None,
                              real_hit: Optional[bool] = None):
-        finalized_now = self.scheduler.observe(content_hash, cache_hint,
-                                               real_hit)
-        if finalized_now:
-            self._rebind_scheduler_policy_for_existing_blocks()
+        if self.scheduler.enabled and not self.scheduler.finalized:
+            finalized_now = self.scheduler.observe(content_hash, cache_hint,
+                                                   real_hit)
+            if finalized_now:
+                self._rebind_scheduler_policy_for_existing_blocks()
+        elif self.scheduler.finalized and self.scheduler.current_policy == 'pdp':
+            self._pdp_observe(content_hash, real_hit)
 
     def should_predict_cache_hint(self) -> bool:
         return self.scheduler.should_predict()
 
     def should_observe_cache_accesses(self) -> bool:
-        return self.scheduler.enabled and not self.scheduler.finalized
+        if self.scheduler.enabled and not self.scheduler.finalized:
+            return True
+        # Keep observing post-warmup so PDP can advance its epoch
+        if self.scheduler.finalized and self.scheduler.current_policy == 'pdp':
+            return True
+        return False
 
     def should_record_post_warmup_metric(self) -> bool:
         return self.scheduler.enabled and self.scheduler.finalized
@@ -635,6 +753,12 @@ class LRUMLEvictor(Evictor):
             return
         final_policy = self.scheduler.current_policy
         self.rrip_values.clear()
+        if final_policy == 'pdp':
+            # Seed protecting_distance from what the shadow PDP learned during warmup
+            shadow_pdp = self.scheduler.shadow_caches.get('pdp')
+            if shadow_pdp is not None:
+                self.pdp_protecting_distance = shadow_pdp.pdp_protecting_distance
+            self.pdp_content_hash_to_block_id.clear()
         for block_id, block in self.free_table.items():
             cache_hint = dict(block.cache_hint)
             cache_hint.pop('use_lru', None)
@@ -644,6 +768,13 @@ class LRUMLEvictor(Evictor):
             block.cache_hint = cache_hint
             if final_policy == 'rrip':
                 self.rrip_values[block_id] = self.RRIP_INSERT_RRPV
+            elif final_policy == 'pdp':
+                # Treat existing blocks as reused; protect for a full PD window
+                self.pdp_protected_until_epoch[block_id] = (
+                    self.pdp_request_epoch + self.pdp_protecting_distance)
+                self.pdp_last_access_epoch[block_id] = self.pdp_request_epoch
+                self.pdp_reused[block_id] = True
+                self.pdp_content_hash_to_block_id[block.content_hash] = block_id
         self.to_delete_blocks.clear()
         self._rebuild_sorted_dict()
         print("scheduler rebound existing blocks to", final_policy,
@@ -658,6 +789,8 @@ class LRUMLEvictor(Evictor):
             return last_accessed
         if policy == 'fifo':
             return self.id_to_first_access[block_id]
+        if policy == 'pdp':
+            return self._pdp_score(block_id)
         if policy == 'belady':
             return -cache_hint['next_timestamp']
         if 'prob_has_next' in cache_hint:
@@ -705,6 +838,28 @@ class LRUMLEvictor(Evictor):
     def evict(self) -> Tuple[int, int]:
         if len(self.free_table) == 0:
             raise ValueError("No usable cache memory left")
+
+        # PDP uses a direct scan so scores are always evaluated at the current
+        # epoch rather than relying on potentially stale sorted_dict entries.
+        sample_policy = self.get_policy(
+            next(iter(self.free_table.values())).cache_hint)
+        if sample_policy == 'pdp':
+            block_id = min(self.free_table.keys(),
+                           key=lambda bid: self._pdp_victim_key(bid))
+            block = self.free_table[block_id]
+            content_hash = block.content_hash
+            self.stat.append("survival_times",
+                             time.time() - block.last_accessed)
+            self._remove_from_sorted_dict(block_id)
+            if self.pdp_content_hash_to_block_id.get(content_hash) == block_id:
+                del self.pdp_content_hash_to_block_id[content_hash]
+            self.pdp_protected_until_epoch.pop(block_id, None)
+            self.pdp_last_access_epoch.pop(block_id, None)
+            self.pdp_reused.pop(block_id, None)
+            del self.free_table[block_id]
+            self.id_to_first_access.pop(block_id, None)
+            return block_id, content_hash
+
         while True:
             if len(self.to_delete_blocks) > 0:
                 (block_id, content_hash, last_accessed) = self.to_delete_blocks.pop()
@@ -733,18 +888,30 @@ class LRUMLEvictor(Evictor):
             self.id_to_first_access.pop(block_id, None)
             return block_id, content_hash
         else:
-            # print('block is not in the sorted_dict')
             raise ValueError("block is not in the sorted_dict")
     
     def add(self, block_id: int, content_hash: int, num_hashed_tokens: int,
             last_accessed: float, cache_hint: dict):
         cache_hint = self._bind_scheduler_policy(cache_hint)
-        if self.get_policy(cache_hint) == 'rrip' and block_id not in self.rrip_values:
+        policy = self.get_policy(cache_hint)
+        if policy == 'rrip' and block_id not in self.rrip_values:
             self.rrip_values[block_id] = self.RRIP_INSERT_RRPV
+        if policy == 'pdp':
+            old_block = self.free_table.get(block_id)
+            if old_block is not None:
+                old_hash = old_block.content_hash
+                if self.pdp_content_hash_to_block_id.get(old_hash) == block_id:
+                    del self.pdp_content_hash_to_block_id[old_hash]
+            reused = content_hash in self.pdp_last_seen_epoch
+            self.pdp_protected_until_epoch[block_id] = (
+                self.pdp_request_epoch + self.pdp_protecting_distance)
+            self.pdp_last_access_epoch[block_id] = self.pdp_last_seen_epoch.get(
+                content_hash, self.pdp_request_epoch)
+            self.pdp_reused[block_id] = reused
+            self.pdp_content_hash_to_block_id[content_hash] = block_id
         if block_id not in self.id_to_first_access:
             self.id_to_first_access[block_id] = last_accessed
         score = self.calc_score(block_id, last_accessed, cache_hint)
-        # print("add: ", block_id, cache_hint)
         self.free_table[block_id] = BlockMetaData(content_hash,
                                                   num_hashed_tokens,
                                                   last_accessed,
@@ -760,14 +927,15 @@ class LRUMLEvictor(Evictor):
             raise ValueError("Attempting to update block that's not in the evictor")
         cache_hint = self._bind_scheduler_policy(cache_hint)
         self._remove_from_sorted_dict(block_id)
-        
-        if self.get_policy(cache_hint) == 'rrip':
+        policy = self.get_policy(cache_hint)
+        if policy == 'rrip':
             self.rrip_values[block_id] = self.RRIP_HIT_RRPV
+        elif policy == 'pdp':
+            self._pdp_protect_block(block_id, reused=True)
         score = self.calc_score(block_id, last_accessed, cache_hint)
         self.free_table[block_id].last_accessed = last_accessed
         self.free_table[block_id].cache_hint = cache_hint
         self.free_table[block_id].score = score
-        
         self.sorted_dict[(score, last_accessed, block_id)] = (block_id, self.free_table[block_id].content_hash)
         self.id_to_last_access[cache_hint['id']] = last_accessed
 
@@ -775,16 +943,111 @@ class LRUMLEvictor(Evictor):
     def remove(self, block_id: int):
         if block_id not in self.free_table:
             raise ValueError("Attempting to remove block that's not in the evictor")
-        
-        # print("remove: ", block_id)
-        if self.get_policy(self.free_table[block_id].cache_hint) == 'rrip':
+        policy = self.get_policy(self.free_table[block_id].cache_hint)
+        if policy == 'rrip':
             self.rrip_values[block_id] = self.RRIP_HIT_RRPV
+        elif policy == 'pdp':
+            content_hash = self.free_table[block_id].content_hash
+            if self.pdp_content_hash_to_block_id.get(content_hash) == block_id:
+                del self.pdp_content_hash_to_block_id[content_hash]
+            self.pdp_protected_until_epoch.pop(block_id, None)
+            self.pdp_last_access_epoch.pop(block_id, None)
+            self.pdp_reused.pop(block_id, None)
         self._remove_from_sorted_dict(block_id)
         del self.free_table[block_id]
 
     @property
     def num_blocks(self) -> int:
         return len(self.free_table)
+
+    # ---- PDP helpers -------------------------------------------------------
+
+    def _pdp_bucket_distance(self, distance: int) -> int:
+        distance = max(1, min(distance, self.pdp_max_distance))
+        if self.pdp_bucket_size == 1:
+            return distance
+        return min(self.pdp_max_distance,
+                   ((distance + self.pdp_bucket_size - 1) //
+                    self.pdp_bucket_size) * self.pdp_bucket_size)
+
+    def _pdp_protect_block(self, block_id: int, reused: bool = True) -> None:
+        if block_id not in self.free_table:
+            return
+        self.pdp_protected_until_epoch[block_id] = (
+            self.pdp_request_epoch + self.pdp_protecting_distance)
+        self.pdp_last_access_epoch[block_id] = self.pdp_request_epoch
+        if reused:
+            self.pdp_reused[block_id] = True
+
+    def _pdp_observe(self, content_hash: int,
+                     real_hit: Optional[bool] = None) -> None:
+        self.pdp_request_epoch += 1
+        self.pdp_total_accesses += 1
+        previous_epoch = self.pdp_last_seen_epoch.get(content_hash)
+        if previous_epoch is not None:
+            dist = self._pdp_bucket_distance(
+                self.pdp_request_epoch - previous_epoch)
+            self.pdp_reuse_distance_counts[dist] += 1
+        self.pdp_last_seen_epoch[content_hash] = self.pdp_request_epoch
+        block_id = self.pdp_content_hash_to_block_id.get(content_hash)
+        if block_id is not None and block_id in self.free_table:
+            reused = bool(real_hit) or previous_epoch is not None
+            self._pdp_protect_block(block_id, reused=reused)
+        if self.pdp_total_accesses % self.pdp_recompute_interval == 0:
+            self._pdp_recompute_protecting_distance()
+
+    def _pdp_recompute_protecting_distance(self) -> None:
+        if not self.pdp_reuse_distance_counts or self.pdp_total_accesses == 0:
+            return
+        distances = sorted(self.pdp_reuse_distance_counts.items())
+        best_distance = self.pdp_protecting_distance
+        best_score = -1.0
+        cumulative_hits = 0
+        cumulative_cost = 0
+        idx = 0
+        for distance in range(1, self.pdp_max_distance + 1,
+                               self.pdp_bucket_size):
+            while idx < len(distances) and distances[idx][0] <= distance:
+                reuse_distance, count = distances[idx]
+                cumulative_hits += count
+                cumulative_cost += reuse_distance * count
+                idx += 1
+            misses = max(0, self.pdp_total_accesses - cumulative_hits)
+            denominator = (cumulative_cost +
+                           misses * (distance + self.pdp_eviction_distance))
+            score = cumulative_hits / denominator if denominator > 0 else 0.0
+            if score > best_score:
+                best_score = score
+                best_distance = distance
+        self.pdp_protecting_distance = best_distance
+
+    def _pdp_score(self, block_id: int) -> float:
+        """Map PDP victim ordering to a single float for sorted_dict."""
+        protected_until = self.pdp_protected_until_epoch.get(block_id, 0)
+        expired = protected_until <= self.pdp_request_epoch
+        if expired:
+            epoch = self.pdp_last_access_epoch.get(block_id, 0)
+            return -3e15 + epoch  # most negative tier; evict lowest epoch first
+        remaining = max(0, protected_until - self.pdp_request_epoch)
+        reused = self.pdp_reused.get(block_id, False)
+        if not reused:
+            return -2e15 - remaining  # inserted: highest remaining PD evicted first
+        return -1e15 - remaining  # reused: highest remaining PD evicted first
+
+    def _pdp_victim_key(self, block_id: int) -> tuple:
+        """Exact multi-key ordering matching PDPEvictor._victim_key."""
+        protected_until = self.pdp_protected_until_epoch.get(block_id, 0)
+        expired = protected_until <= self.pdp_request_epoch
+        if expired:
+            epoch = self.pdp_last_access_epoch.get(block_id, 0)
+            last_accessed = self.free_table[block_id].last_accessed
+            return (0, epoch, last_accessed, block_id)
+        remaining = max(0, protected_until - self.pdp_request_epoch)
+        reused = self.pdp_reused.get(block_id, False)
+        return (1, 1 if reused else 0, -remaining,
+                -self.pdp_last_access_epoch.get(block_id, 0), block_id)
+
+    # ---- end PDP helpers ---------------------------------------------------
 
     def _refresh(self):
         self._rebuild_sorted_dict()
@@ -798,11 +1061,11 @@ class LRUMLEvictor(Evictor):
         # Sort by survival_time in descending order
         survival_list.sort(key=lambda x: (x[2], x[1]))
 
-        # mark outdated blocks 
+        # mark outdated blocks
         to_delete_cnt = 0
         for block_id, _, _ in survival_list:
             block = self.free_table[block_id]
-            if self.get_policy(block.cache_hint) == 'rrip':
+            if self.get_policy(block.cache_hint) in ('rrip', 'pdp'):
                 continue
             id = block.cache_hint['id']
             if self.id_to_last_access[id] == block.last_accessed:
