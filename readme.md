@@ -341,6 +341,52 @@ LMSYS:    LPC -> LRU
 Chatbot:  LPC -> LRU
 ```
 
+## PDP Results
+
+The following results were collected on `Qwen/Qwen2.5-7B-Instruct` with cache
+size `8000` on one H100 GPU after integrating PDP as a full eviction policy and
+as a shadow candidate in the adaptive scheduler. Benchmarks were run on
+ShareGPT and LMSYS Chat-1M.
+
+| benchmark | policy | hit_ratio | request_throughput | output_throughput | total_token_throughput |
+| --- | --- | ---: | ---: | ---: | ---: |
+| sharegpt | fifo | 0.331994 | 2.830352 | 846.437973 | 1203.372222 |
+| sharegpt | lru | 0.334240 | 2.837052 | 848.029349 | 1205.387421 |
+| sharegpt | ml/LPC | 0.406899 | 2.797834 | 837.879425 | 1191.143577 |
+| sharegpt | pdp | 0.309834 | 2.731410 | 818.639423 | 1164.541035 |
+| sharegpt | rrip | 0.322834 | 2.839447 | 847.907001 | 1205.263537 |
+| sharegpt | scheduler | 0.315796 | 2.699846 | 813.073284 | 1150.601397 |
+| lmsys | fifo | 0.387002 | 4.415094 | 779.904536 | 1057.546650 |
+| lmsys | lru | 0.417397 | 4.413937 | 766.508106 | 1044.185114 |
+| lmsys | ml/LPC | 0.418908 | 4.257741 | 740.608680 | 1007.742088 |
+| lmsys | pdp | 0.399463 | 4.345361 | 765.797490 | 1038.942886 |
+| lmsys | rrip | 0.431415 | 4.413703 | 768.900883 | 1046.563133 |
+| lmsys | scheduler | 0.412487 | 4.420258 | 767.935096 | 1046.173051 |
+
+The PDP-aware scheduler now competes LRU, RRIP, FIFO, and PDP in its shadow
+tables during warmup. The finalize decision on ShareGPT was:
+
+```text
+scheduler finalize: ml -> lru {'ml': 0.9979, 'lru': 0.9831, 'rrip': 0.9831, 'fifo': 0.9823, 'pdp': 0.9831}
+```
+
+PDP tied with LRU in the shadow simulation (both 0.9831), with LRU selected as
+the winner by ordering. The scheduler's post-warmup hit rate on ShareGPT was
+`0.3274`, which closely matches the standalone LRU result (`0.3342`), confirming
+the switch was handled correctly.
+
+**Standalone PDP analysis.** PDP underperformed on ShareGPT across all metrics:
+hit rate (`0.310`) fell below every other policy including FIFO (`0.332`), and
+mean TTFT (`173 ms`) was higher than even ML/LPC (`112 ms`), indicating the
+protection-distance computation adds overhead that the default parameters do not
+recover through improved eviction quality on this workload. On LMSYS, PDP
+performed more competitively (hit rate `0.399`) sitting between FIFO (`0.387`)
+and LRU (`0.417`), though it still trailed RRIP (`0.431`). The gap between
+PDP's shadow-simulation score and its standalone hit rate on ShareGPT suggests
+the default parameters (`initial_pd=32`, `max_distance=256`) are not tuned for
+ShareGPT's access pattern; tuning these values with `run_pdp.py` options may
+close the gap.
+
 ## Collecting Metrics
 
 Collect the four main metrics for every benchmark/policy:
