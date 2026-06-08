@@ -150,7 +150,7 @@ async def main(sizes,
         return log_file_name
 
 
-    def wait_for_server_ready(log_file_name, timeout=600):
+    def wait_for_server_ready(log_file_name, timeout=900):
         """Wait until the server is ready or a timeout occurs."""
         for _ in range(timeout):
             if os.path.exists(log_file_name):
@@ -324,8 +324,8 @@ if __name__ == "__main__":
 # varying cache size
 if __name__ == "__main__":
     for alg in ['ml']:
-        # for dataset in ['sharegpt', 'lmsys', 'chatbot']:
-        for dataset in ['sharegpt', 'lmsys']:
+        for dataset in ['sharegpt']:
             for sizes in [[8000]]:
                 for scales in [[1]]:
-                    asyncio.run(main(sizes, scales, alg, dataset, 'size++'))
+                    asyncio.run(main(sizes, scales, alg, dataset, 'size++',
+                                    client_algorithms=['lru', 'pdp', 'scheduler']))
