@@ -3882,3 +3882,32 @@ INFO 06-08 05:00:40 [metrics.py:491] Avg prompt throughput: 0.0 tokens/s, Avg ge
 INFO 06-08 05:00:40 [metrics.py:507] Prefix cache hit rate: GPU: 31.58%, CPU: 0.00%
 INFO 06-08 05:00:50 [metrics.py:491] Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 0.0 tokens/s, Running: 0 reqs, Swapped: 0 reqs, Pending: 0 reqs, GPU KV cache usage: 0.0%, CPU KV cache usage: 0.0%.
 INFO 06-08 05:00:50 [metrics.py:507] Prefix cache hit rate: GPU: 31.58%, CPU: 0.00%
+INFO 06-08 06:15:05 [launcher.py:74] Shutting down FastAPI HTTP server.
+ERROR 06-08 06:15:05 [engine.py:410] MQLLMEngine terminated
+ERROR 06-08 06:15:05 [engine.py:410] Traceback (most recent call last):
+ERROR 06-08 06:15:05 [engine.py:410]   File "/home/ubuntu/CSE231/vllm/vllm/engine/multiprocessing/engine.py", line 407, in run_mp_engine
+ERROR 06-08 06:15:05 [engine.py:410]     engine.start()
+ERROR 06-08 06:15:05 [engine.py:410]   File "/home/ubuntu/CSE231/vllm/vllm/engine/multiprocessing/engine.py", line 146, in start
+ERROR 06-08 06:15:05 [engine.py:410]     self.cleanup()
+ERROR 06-08 06:15:05 [engine.py:410]   File "/home/ubuntu/CSE231/vllm/vllm/engine/multiprocessing/engine.py", line 395, in signal_handler
+ERROR 06-08 06:15:05 [engine.py:410]     raise KeyboardInterrupt("MQLLMEngine terminated")
+ERROR 06-08 06:15:05 [engine.py:410] KeyboardInterrupt: MQLLMEngine terminated
+Process SpawnProcess-1:
+Traceback (most recent call last):
+  File "/root/miniconda3/envs/vllm-cuda121/lib/python3.10/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/root/miniconda3/envs/vllm-cuda121/lib/python3.10/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/home/ubuntu/CSE231/vllm/vllm/engine/multiprocessing/engine.py", line 412, in run_mp_engine
+    raise e
+  File "/home/ubuntu/CSE231/vllm/vllm/engine/multiprocessing/engine.py", line 407, in run_mp_engine
+    engine.start()
+  File "/home/ubuntu/CSE231/vllm/vllm/engine/multiprocessing/engine.py", line 146, in start
+    self.cleanup()
+  File "/home/ubuntu/CSE231/vllm/vllm/engine/multiprocessing/engine.py", line 395, in signal_handler
+    raise KeyboardInterrupt("MQLLMEngine terminated")
+KeyboardInterrupt: MQLLMEngine terminated
+[rank0]:[W608 06:15:06.049945889 ProcessGroupNCCL.cpp:1250] Warning: WARNING: process group has NOT been destroyed before we destruct ProcessGroupNCCL. On normal program exit, the application should call destroy_process_group to ensure that any pending NCCL operations have finished in this process. In rare cases this process can exit before this point and block the progress of another member of the process group. This constraint has always been present,  but this warning has only been added since PyTorch 2.4 (function operator())
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
