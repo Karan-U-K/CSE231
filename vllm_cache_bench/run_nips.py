@@ -324,7 +324,8 @@ if __name__ == "__main__":
 # varying cache size
 if __name__ == "__main__":
     for alg in ['ml']:
-        for dataset in ['sharegpt', 'lmsys', 'chatbot']:
+        # for dataset in ['sharegpt', 'lmsys', 'chatbot']:
+        for dataset in ['sharegpt', 'lmsys']:
             for sizes in [[8000]]:
                 for scales in [[1]]:
                     asyncio.run(main(sizes, scales, alg, dataset, 'size++'))
