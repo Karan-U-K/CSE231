@@ -387,6 +387,36 @@ the default parameters (`initial_pd=32`, `max_distance=256`) are not tuned for
 ShareGPT's access pattern; tuning these values with `run_pdp.py` options may
 close the gap.
 
+## PDP Results — 14B Model
+
+The following results were collected on `Qwen/Qwen2.5-14B-Instruct` with cache
+size `8000` on one H100 GPU after integrating PDP into the adaptive scheduler.
+This run benchmarked LRU, PDP, and scheduler on ShareGPT. Note that the
+scheduler used `--num-gpu-blocks-override 7750` (250 blocks reserved for the
+LPC predictor), while LRU and PDP used the full 8000 blocks.
+
+| benchmark | policy | hit_ratio | request_throughput | output_throughput | total_token_throughput |
+| --- | --- | ---: | ---: | ---: | ---: |
+| sharegpt | lru | 0.305538 | **2.662506** | 799.791775 | 1125.611173 |
+| sharegpt | pdp | 0.281369 | 2.544655 | 766.249204 | 1064.567865 |
+| sharegpt | scheduler | **0.370312** | 2.638150 | 794.366741 | 1117.550010 |
+
+The scheduler's hit ratio (`0.370`) substantially exceeds standalone LRU
+(`0.306`) despite having 250 fewer cache blocks, indicating the scheduler kept
+LPC running after warmup. The scheduler's mean TTFT (`181.8 ms`) is also
+markedly higher than LRU's (`101.4 ms`), consistent with the LPC predictor
+continuing to run post-warmup. This contrasts with the 7B result where the
+scheduler switched to LRU; on the 14B model the LPC hit-rate advantage cleared
+the 10% threshold, making it worthwhile to absorb the predictor overhead.
+
+**Standalone PDP on 14B.** PDP hit rate (`0.281`) fell below LRU (`0.306`) with
+mean TTFT of `213.2 ms` — the worst TTFT across all policies in this run,
+including the scheduler running LPC. The same default-parameter mismatch seen on
+7B ShareGPT (`initial_pd=32`, `max_distance=256` not tuned for bursty short
+sessions) persists at 14B scale. The scheduler's p99 TTFT was `3045 ms`,
+reflecting GPU memory pressure from the 14B model weights and LPC predictor
+coexisting on a single H100.
+
 ## Collecting Metrics
 
 Collect the four main metrics for every benchmark/policy:
