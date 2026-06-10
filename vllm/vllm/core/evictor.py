@@ -568,15 +568,34 @@ class EvictionPolicyScheduler:
             "scheduler_observe_stride", 4)))
         self.num_observed_accesses = 0
         self.ml_events = deque()
+        self.shadow_policies = self._parse_shadow_policies(
+            config.get("scheduler_shadow_policies"))
         self.shadow_caches = {
             policy: ShadowPolicyCache(
                 policy, self.capacity,
                 config if policy == "pdp" else None)
-            for policy in self.SHADOW_POLICIES
+            for policy in self.shadow_policies
         }
 
     def _as_bool(self, value) -> bool:
         return str(value).lower() in ("1", "true", "yes", "on")
+
+    def _parse_shadow_policies(self, value) -> Tuple[str, ...]:
+        if value is None or value == "":
+            return self.SHADOW_POLICIES
+        policies = tuple(policy.strip() for policy in str(value).split("|")
+                         if policy.strip())
+        invalid = [policy for policy in policies if policy not in self.POLICIES]
+        if invalid:
+            raise ValueError(
+                "Unknown scheduler shadow policies: "
+                f"{invalid}. Supported policies: {self.POLICIES}")
+        policies = tuple(policy for policy in policies if policy != "ml")
+        if not policies:
+            raise ValueError(
+                "scheduler_shadow_policies must include at least one "
+                "non-ML policy")
+        return policies
 
     def set_capacity(self, capacity: int):
         self.capacity = capacity
@@ -631,7 +650,7 @@ class EvictionPolicyScheduler:
                 for policy, cache in self.shadow_caches.items()
             }
         }
-        best_shadow_policy = max(self.SHADOW_POLICIES,
+        best_shadow_policy = max(self.shadow_policies,
                                  key=lambda p: hit_rates[p])
         best_other = hit_rates[best_shadow_policy]
         threshold = (self.small_threshold if self.model_size_b <= 14 else

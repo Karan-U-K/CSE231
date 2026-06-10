@@ -1,6 +1,22 @@
 # Setup
 
-This repository extends vLLM prefix caching with multiple cache eviction policies, implements a scheduler for dynamically switching between those policies, and provides benchmark scripts for comparing cache hit rate and serving throughput across conversational workloads. LPC can improve cache hit rate, but on small models its predictor and embedding overhead can reduce actual serving throughput; the scheduler is designed to keep LPC only when its hit-rate gain is large enough to justify that overhead.
+This repository extends vLLM prefix caching with multiple cache eviction policies, implements a scheduler for dynamically selecting between those policies, and provides benchmark scripts for comparing cache hit rate and serving throughput across conversational workloads. The core question is whether eviction is meaningful for KV caching when reuse happens across conversations, not just within one conversation. LPC can improve cache hit rate, but on small models its predictor and embedding overhead can reduce actual serving throughput; the scheduler keeps LPC only when its hit-rate gain is large enough to justify that overhead.
+
+## Design Framing
+
+KV-cache eviction is most useful when the server sees recurring prefixes across
+requests or conversations. This project therefore treats cache reuse as a
+global, service-level phenomenon: the cache is shared across many active
+conversations, and policies are judged by how well they retain blocks that are
+likely to be reused by future conversations. We do not assume that a policy can
+reliably predict reuse inside a single ongoing conversation; that signal is weak
+and often unavailable at eviction time. Instead, the benchmark asks whether
+history across many conversations can improve eviction decisions.
+
+This matters because cache hit rate is only an intermediate metric. A policy is
+useful only when the avoided prefill work is larger than the policy overhead,
+including metadata maintenance, embedding computation, predictor inference, and
+any extra memory pressure.
 
 ## Cloud Machine Recommendation
 **We recommend using a cloud machine with high-performance GPUs for running these experiments.** We use **[Hyperstack H100](https://console.hyperstack.cloud/deploy-virtual-machine)** for optimal performance. Other cloud options include:
@@ -74,7 +90,44 @@ The implementation supports these eviction policies:
 - `fifo`: first in, first out.
 - `pdp`: protecting-distance policy adapted to prefix-cache reuse distance.
 - `scheduler`: warmup-based dynamic selector over LPC (`ml`), `lru`, `rrip`,
-  and `fifo`.
+  `fifo`, and, in the PDP-aware runs, `pdp`.
+
+## Workloads and Traces
+
+The benchmark traces are conversation-style request streams derived from public
+chat datasets rather than synthetic fixed-length prompts. Each run replays
+conversation turns through the OpenAI-compatible vLLM serving benchmark client
+with `max_active_conversations = 200`, `session_rate = 10`, and
+`request_rate = 0.01` for the main ShareGPT, LMSYS, and Chatbot Arena runs.
+
+The supported workload families are:
+
+- `sharegpt`: ShareGPT conversations from
+  `ShareGPT_V3_unfiltered_cleaned_split.json`. These are general assistant
+  conversations and include a long tail of prompt lengths.
+- `lmsys`: `lmsys/lmsys-chat-1m` from Hugging Face. These are real chat
+  interaction logs and are generally shorter on average than ShareGPT in the
+  collected runs.
+- `chatbot`: `lmsys/chatbot_arena_conversations` from Hugging Face. These are
+  side-by-side Chatbot Arena conversations. The benchmark configuration is in
+  `run_nips.py`; local raw logs in this checkout do not include the same
+  per-request token-length arrays as the ShareGPT and LMSYS logs.
+- `tay`: an additional local trace supported by `run_nips.py`, mainly useful
+  for smaller-scale debugging.
+
+Measured token-length summaries from the checked-in client logs are:
+
+| model | workload | completed requests | avg prompt tokens | p50 prompt | p95 prompt | avg response tokens | p50 response | p95 response |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Qwen2.5-7B-Instruct | sharegpt | 3414 | 131.4 | 20 | 728 | 298.8 | 276 | 712 |
+| Qwen2.5-7B-Instruct | lmsys | 5316 | 64.7 | 17 | 322 | 173.7 | 128 | 452 |
+| Qwen2.5-14B-Instruct | sharegpt | 3218 | 137.1 | 20 | 776 | 300.3 | 276 | 722 |
+
+These values come from `input_lens` and `output_lens` in the checked-in
+`client_logs/8000_lru.json` files. The trace source is important because a cache
+policy that helps a repeated-prefix chat workload may not help code generation,
+retrieval-augmented generation, or one-shot question answering workloads with
+different prefix-sharing patterns.
 
 ## Scheduler Workflow
 
@@ -84,27 +137,37 @@ In the code, the LPC policy is named `ml`.
 2. During the first `scheduler_warmup = 100` seconds:
    - The real cache uses LPC.
    - The predictor is allowed to compute `prob_has_next`.
-   - The scheduler maintains three metadata-only shadow tables to simulate
-     `lru`, `rrip`, and `fifo`.
+   - The scheduler maintains metadata-only shadow tables to simulate `lru`,
+     `rrip`, `fifo`, and optionally `pdp` in PDP-aware runs.
    - The LPC hit rate is measured using the real cache hit rate.
 3. After the warmup period ends:
-   - The scheduler compares the real LPC hit rate with the three shadow hit
-     rates.
+   - The scheduler compares the real LPC hit rate with the shadow hit rates.
    - It selects one final policy and freezes that choice.
    - If the LPC hit rate is greater than the best shadow hit rate plus the
      threshold, it chooses LPC. The threshold offsets LPC's predictor overhead.
    - Otherwise, it chooses the best-performing traditional eviction policy
-     among `lru`, `rrip`, and `fifo`.
+     among the enabled non-LPC candidates.
 4. After final selection:
    - If the final policy is not LPC, new requests are no longer enqueued to the
      predictor.
    - If the final policy is LPC, the predictor continues to run.
 
+The current scheduler is an adaptive evaluation mechanism, not a full
+"run every policy and switch whenever useful" production design. During warmup
+it runs one real KV cache and compares that real policy against metadata-only
+shadow policies. It then makes one final choice. A more ambitious design could
+keep several policy candidates online, switch repeatedly as the workload
+changes, or synthesize a scheduler from workload features in the spirit of
+SchedCP-style scheduler synthesis. That would require larger changes: policy
+state would need to remain valid across switches, the cost of switching would
+need to be modeled explicitly, and the selector would need guardrails to avoid
+thrashing when hit-rate differences are small.
+
 ## Policy Switching Cost
 
 The scheduler is designed to avoid expensive cache-state rebuilds during policy
 selection. It does not maintain four real KV caches. During warmup, the real
-cache uses LPC, while `lru`, `rrip`, and `fifo` are simulated with lightweight
+cache uses LPC, while the non-LPC candidates are simulated with lightweight
 metadata-only shadow tables keyed by prefix block hash.
 
 When warmup ends, the scheduler performs a single policy switch and freezes the
@@ -115,7 +178,7 @@ being protected indefinitely after switching to `lru`, `rrip`, or `fifo`.
 
 As a result, switching cost is mainly:
 
-- Maintaining three metadata-only shadow tables during warmup.
+- Maintaining metadata-only shadow tables during warmup.
 - Computing the final hit-rate comparison once.
 - Rebinding existing block metadata once and rebuilding the eviction ordering
   after the switch.
@@ -133,6 +196,29 @@ Default scheduler settings:
 - Initial policy: `ml`.
 - Minimum event warning threshold: `0`.
 - Shadow-table observe stride: `4`.
+
+## When Is a Hit-Rate Gain Meaningful?
+
+The scheduler uses a model-size-dependent hit-rate threshold because a higher
+hit rate does not automatically imply higher throughput. LPC has additional
+costs: it computes embeddings, runs a predictor, stores predictor metadata, and
+reserves some GPU memory that would otherwise be usable for KV blocks. A
+meaningful gain is therefore the amount of extra hit rate required to offset
+those costs.
+
+In the current implementation, LPC must beat the best non-LPC shadow policy by:
+
+- `0.10` absolute hit ratio for models up to and including `14B`.
+- `0.05` absolute hit ratio for larger models.
+
+For example, if the best traditional policy has a `0.33` hit ratio on a small
+model, LPC must reach at least `0.43` before the scheduler keeps LPC. This is a
+conservative heuristic rather than a theorem. The right threshold depends on
+model size, prompt length, batch pressure, GPU memory headroom, and the actual
+latency cost of the predictor. In the included 7B results, LPC often improves
+hit rate but does not improve throughput, which motivates the larger threshold.
+On larger models, each avoided prefill token is more expensive, so a smaller
+hit-rate gain can be meaningful.
 
 `--min-events` is a guard for sample size during warmup. It counts sampled
 prefix-block access observations, not requests. The scheduler still finalizes
@@ -190,6 +276,8 @@ python run_scheduler.py --observe-stride 8
 python run_scheduler.py --datasets sharegpt
 python run_scheduler.py --datasets sharegpt,lmsys,chatbot --sizes 8000 --scales 1
 python run_scheduler.py --small-threshold 0.10 --large-threshold 0.05
+python run_scheduler.py --shadow-policies lru,rrip,fifo
+python run_scheduler.py --shadow-policies lru,rrip,fifo,pdp --pdp-initial-pd 32 --pdp-max-distance 256
 ```
 
 Useful PDP options:
@@ -456,4 +544,12 @@ the latest record with the most complete metrics. To average runs:
 
 ```bash
 python collect_policy_metrics.py --results-dir results --mode mean
+```
+
+Summarize prompt and response token lengths from existing client logs:
+
+```bash
+cd vllm_cache_bench
+python summarize_workloads.py --results-dir results
+python summarize_workloads.py --results-dir results --format csv
 ```
